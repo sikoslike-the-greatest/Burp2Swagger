@@ -1,14 +1,23 @@
 # Burp2Swagger
 
-Burp Suite extension that takes OpenAPI/Swagger JSON responses from proxy history or site map and serves them in a local Swagger UI.
+Burp Suite extension that takes OpenAPI/Swagger JSON responses and serves them in a local Swagger UI.
 
 ## How it works
 
 1. Browse a target through Burp — its `swagger.json` / `openapi.json` endpoint gets captured
 2. Right-click the request in site map, proxy history, or any Burp tab → **"Send to Swagger UI"**
-3. The response body (raw OpenAPI spec) is saved and served via a built-in HTTP server
-4. Open `http://localhost:8090` — your spec(s) are rendered in Swagger UI
-5. Multiple specs are supported — they appear in a dropdown selector
+3. Open `http://localhost:8090` — your spec(s) are rendered in Swagger UI
+4. Multiple specs supported — they appear in a dropdown selector
+
+## Managing specs
+
+The **Burp2Swagger** tab in Burp Suite shows all loaded specs:
+
+- **Edit JSON** — edit spec content directly, with JSON validation
+- **Delete** — remove selected specs
+- **Delete All** — clear everything
+
+Specs are stored inside the Burp project file — they persist across sessions and are isolated per project.
 
 ## Installation
 
@@ -29,5 +38,6 @@ Jar will be at `build/libs/Burp2Swagger.jar`.
 ## Notes
 
 - The extension starts a lightweight HTTP server on port `8090`
-- Specs are stored in `burp2swagger_out/` in Burp's working directory
+- No files are written to disk — everything is served from memory
+- Specs persist in the Burp project file via the Persistence API
 - The server stops automatically when the extension is unloaded
