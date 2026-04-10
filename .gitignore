@@ -1,2 +1,16 @@
-# Project exclude paths
+# Build output
+/build/
 /out/
+
+# Gradle cache
+.gradle/
+
+# IDE
+.idea/
+*.iml
+
+# Extension runtime output
+burp2swagger_out/
+
+# Old libs
+/lib/

@@ -1,423 +1,237 @@
 package burp;
 
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
+import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 
 import com.google.gson.*;
-import com.sun.net.httpserver.*;
 
 import javax.swing.*;
-import java.awt.event.ActionEvent;
-import java.awt.event.ActionListener;
-import java.io.File;
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.Writer;
-import java.net.InetSocketAddress;
+import java.awt.Component;
+import java.io.*;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
-public class BurpExtender implements IBurpExtender, IHttpListener, IExtensionStateListener,IContextMenuFactory{
-    private IBurpExtenderCallbacks callbacks;
-    private IExtensionHelpers helpers;
-    private PrintWriter stdout;
-    // private JPanel panel;
-    // private JSplitPane splitPane1;
-    // private JButton button;
-    // private JTextArea textArea = new JTextArea("",10,10);
-
-    private HttpServer server;
-    private JsonHelper jsonHelper;
-    private Map<String, JsonHelper> jsonHelpers;
+public class BurpExtender implements BurpExtension {
+    private MontoyaApi api;
+    private volatile ServerSocket serverSocket;
+    private volatile boolean serverRunning;
     private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private JsonArray htmlHolder = new JsonArray();
 
+    // specName -> json string
+    private final Map<String, String> specs = new ConcurrentHashMap<>();
+    private final Path outDir = Paths.get(System.getProperty("user.dir"), "burp2swagger_out");
 
     @Override
-    public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
-        this.callbacks = callbacks;
-        this.helpers = callbacks.getHelpers();
-        this.callbacks.registerHttpListener(this);
-        this.callbacks.registerExtensionStateListener(this);
-        this.callbacks.registerContextMenuFactory(this);
+    public void initialize(MontoyaApi api) {
+        this.api = api;
+        api.extension().setName("Burp2Swagger");
 
-        callbacks.setExtensionName("Burp2Swagger Java 18");
-        this.stdout = new PrintWriter(callbacks.getStdout(), true);
+        try { Files.createDirectories(outDir); } catch (IOException ignored) {}
 
-        //UI tab
-//        SwingUtilities.invokeLater(new Runnable() {
-//            @Override
-//            public void run() {
-//                panel = new JPanel();
-//                button = new JButton("dump json");
-//
-//
-//
-//                JLabel label = new JLabel("Requested URLs:");
-//                JTextArea textArea = new JTextArea("",10,10);
-//                button.addActionListener(new ActionListener() {
-//                    @Override
-//                    public void actionPerformed(ActionEvent e) {
-//                        textArea.setText(jsonHelper.dump());
-//
-//                    }
-//                });
-//                panel.setBounds(100,100,250,100);
-//                panel.add(label);
-//                panel.add(button);
-//                panel.add(textArea);
-//                textArea.setVisible(true);
-//                callbacks.customizeUiComponent(panel);
-//
-//
-//                // second variant
-//                // setup panels
-//                JLabel label1 = new JLabel("Requested URLs:");
-//                JLabel label2 = new JLabel("Label 2:");
-//                JLabel label3 = new JLabel("Label 3:");
-//                JPanel panelTop = new JPanel();
-//                JPanel panelMiddle = new JPanel();
-//                JPanel panelBottom = new JPanel();
-//                JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, panelTop,panelMiddle);
-//                splitPane1 = new JSplitPane(JSplitPane.VERTICAL_SPLIT, splitPane, panelBottom);
-//                panelTop.add(label1);
-//                panelMiddle.add(label2);
-//                panelBottom.add(label3);
-//                splitPane.setVisible(true);
-//                splitPane1.setVisible(true);
-//                callbacks.customizeUiComponent(splitPane);
-//                callbacks.customizeUiComponent(splitPane1);
-//
-//
-//                callbacks.addSuiteTab(BurpExtender.this);
-//            }
-//        });
-
-        stdout.println("Server dir: "+ System.getProperty("user.dir") + "/burp2swagger_out/");
-
-        File f = new File("burp2swagger_out/index.html");
-        if (!f.exists()){
-            f.getParentFile().mkdirs();
-        }
-
-
-
-        server = SimpleFileServer.createFileServer(new InetSocketAddress(8090),
-                Path.of(System.getProperty("user.dir") + "/burp2swagger_out/"), SimpleFileServer.OutputLevel.VERBOSE);
+        // Start file server
         try {
-            server.start();
-            stdout.println("Launched server for swagger on port 8090");
+            serverSocket = new ServerSocket(8090);
+            serverRunning = true;
+            Thread t = new Thread(() -> runServer(), "Burp2Swagger-HTTP");
+            t.setDaemon(true);
+            t.start();
+            api.logging().logToOutput("Burp2Swagger: server started on http://localhost:8090");
         } catch (Exception e) {
-            stdout.println("Port 8090 in use");
+            api.logging().logToError("Burp2Swagger: port 8090 in use - " + e.getMessage());
         }
 
-        stdout.println("Visit any in-scope website and then check localhost:8090 or add them from site map.");
-        jsonHelpers = new HashMap<>();
+        // Context menu: send response body (OpenAPI spec) to Swagger UI
+        api.userInterface().registerContextMenuItemsProvider(new ContextMenuItemsProvider() {
+            @Override
+            public List<Component> provideMenuItems(ContextMenuEvent event) {
+                List<HttpRequestResponse> selected = event.selectedRequestResponses();
+                if (selected == null || selected.isEmpty()) return Collections.emptyList();
 
-        //jsonHelper = new JsonHelper();
-
-
-        //stdout.println(jsonHelper.dump());
-    }
-
-    @Override
-    public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
-        var requestUrl = helpers.analyzeRequest(messageInfo).getUrl();
-        var request = helpers.analyzeRequest(messageInfo.getRequest());
-        var domain = requestUrl.getProtocol() + "://" + requestUrl.getHost();
-        if (messageIsRequest&& callbacks.isInScope(requestUrl)){ //&& callbacks.isInScope(requestUrl)
-            // debug
-//            stdout.println("messGot in scope request to " + messageInfo.getHttpService());
-//            stdout.println("mess2Got in scope request to " + messageInfo.getHttpService().toString());
-//            stdout.println("help "+ requestUrl);
-//            stdout.println("help "+ requestUrl.getProtocol() + "://" + requestUrl.getHost());
-//            stdout.println("help "+ requestUrl.getPath());
-//            stdout.println("help "+ helpers.analyzeRequest(messageInfo).getMethod());
-            //stdout.println("1" + helpers.analyzeResponse(messageInfo.getResponse()).getStatusCode());
-            //var a = helpers.bytesToString(messageInfo.getRequest()).substring(request.getBodyOffset());
-            //stdout.println("asd"+a);
-            //stdout.println(JsonParser.parseString(a).isJsonArray() + " " + JsonParser.parseString(a).isJsonObject());
-
-
-            //if (!jsonHelper.isDomainSet){
-            // checking for known ports
-            // TODO : probably don't include localhost:8090 as domain
-
-            if (jsonHelpers.containsKey(domain)){
-                jsonHelper = jsonHelpers.get(domain);
-            }
-            else {
-                jsonHelper = new JsonHelper();
-                jsonHelpers.put(domain,jsonHelper);
-            }
-
-            if (request.getMethod().equals("OPTIONS")){
-                stdout.println("got options");
-                stdout.println(request.getHeaders());
-            }
-
-            if (requestUrl.getPort() == 80 || requestUrl.getPort() == 443){
-                jsonHelper.addDomain(domain);
-            } else {
-                jsonHelper.addDomain(domain + ":" + requestUrl.getPort());
-            }
-
-            if (request.getHeaders().contains("Referer: http://localhost:8090/")){
-                addRequestHeaders(messageInfo);
-            }
-
-            // TODO: check for future settings
-            //for (var header :request.getHeaders()){
-            //    if (header.startsWith("Authorization:")){
-                    jsonHelper.addAuth();
-            //    }
-            //}
-
-            //}
-
-            // THIS WAS UNCOMMENTED
-            //jsonHelper.add(helpers.analyzeRequest(messageInfo));
-            //textArea.append(helpers.analyzeRequest(messageInfo).getUrl().getHost() + "\n");
-        }
-        else if (!messageIsRequest && callbacks.isInScope(requestUrl)){
-            // debug
-//            var responseParams = helpers.analyzeRequest(messageInfo.getResponse()).getParameters();
-//            var requestParams = helpers.analyzeRequest(messageInfo.getRequest()).getParameters();
-//
-//            stdout.println("response ----------");
-//            for (IParameter responseParam : responseParams) {
-//                stdout.println(responseParam.getName() + " = " + responseParam.getValue() + " pb " + responseParam.getType());
-//            }
-//            //stdout.println(helpers.analyzeResponse(messageInfo.getResponse()));
-//            stdout.println("----------");
-//            stdout.println("request ----------");
-//            for (IParameter requestParam : requestParams) {
-//                stdout.println(requestParam.getName() + " = " + requestParam.getValue() + " pb " + requestParam.getType());
-//            }
-//
-//            stdout.println("----------");
-//
-//            stdout.println("got params in response " + Arrays.toString(helpers.analyzeRequest(messageInfo.getResponse()).getParameters().toArray()));
-//            stdout.println("got params in request " + helpers.analyzeRequest(messageInfo.getRequest()).getParameters());
-//            stdout.println("response "+ helpers.analyzeResponse(messageInfo.getResponse()).getStatusCode());
-
-
-            // TODO: CORS bypass doesn't work with preflights aka OPTIONS (test if works)
-            // TODO: JSON Breaks at yandex.ru/ads/meta/265882
-            // TODO: file upload
-
-            // TODO: bug airbnb returns bad content type on preflight
-            // TODO: flase and true counted as string, but should be bool
-            if (request.getHeaders().contains("Referer: http://localhost:8090/")){
-                addResponseHeaders(messageInfo);
-            }
-            // TODO add ! back
-            // TODO check if there should be "else if"
-            if (!requestUrl.getPath().contains(".")){
-                if (jsonHelpers.containsKey(domain)){
-                    jsonHelper = jsonHelpers.get(domain);
+                // Check at least one has a response
+                boolean hasResponse = false;
+                for (HttpRequestResponse rr : selected) {
+                    if (rr.response() != null) { hasResponse = true; break; }
                 }
-                else {
-                    jsonHelper = new JsonHelper();
-                    jsonHelpers.put(domain,jsonHelper);
-                }
-                jsonHelper.addRequest(messageInfo,helpers);
-                saveToFiles(domain);
-            }
-//            stdout.println("Parameters");
-//            for (var par : helpers.analyzeRequest(messageInfo.getResponse()).getParameters()){
-//                stdout.println("Name: "+ par.getName() + " Value: "+ par.getValue() + " Type "+ par.getType());
-//            }
+                if (!hasResponse) return Collections.emptyList();
 
-        }
+                JMenuItem sendItem = new JMenuItem("Send to Swagger UI");
+                sendItem.addActionListener(e -> {
+                    for (HttpRequestResponse rr : selected) {
+                        if (rr.response() == null) continue;
+                        String body = rr.response().bodyToString();
+                        if (body == null || body.isBlank()) continue;
 
-    }
-
-    private void saveToFiles(String domain) {
-        var entry = jsonHelpers.get(domain);
-
-        try{
-
-            JsonObject htmlPart = new JsonObject();
-            htmlPart.addProperty("url", "http://localhost:8090/" + domain.replace("://","-" ) + ".json");
-            htmlPart.addProperty("name", domain);
-            if (!htmlHolder.contains(htmlPart)){
-                htmlHolder.add(htmlPart);
-            }
-
-            System.out.println("Writing to file");
-            Writer writer = Files.newBufferedWriter(Paths.get("burp2swagger_out/"+ domain.replace("://","-") +".json"));
-            gson.toJson(entry.dumpAsJsonObject(), writer);
-            writer.close();
-        }
-        catch (IOException e){
-            System.out.println("Failed writing");
-            throw new RuntimeException(e);
-        }
-        dropHtml(htmlHolder);
-    }
-
-//    @Override
-//    public String getTabCaption() {
-//        return "Test Tab";
-//    }
-//
-//    @Override
-//    public Component getUiComponent() {
-//        //return splitPane1;
-//        return panel;
-//    }
-
-    public IExtensionHelpers getHelpers(){
-        return helpers;
-    }
-
-    public void addRequestHeaders(IHttpRequestResponse messageInfo){
-        var request = messageInfo.getRequest();
-        var requestStr = helpers.bytesToString(request);
-        var requestParsed = helpers.analyzeRequest(messageInfo);
-        var body = requestStr.substring(requestParsed.getBodyOffset());
-        var headers = requestParsed.getHeaders();
-        headers.remove("Origin: http://localhost:8090");
-        headers.add("Origin: "+ requestParsed.getUrl().getProtocol() + "://" + requestParsed.getUrl().getHost());
-
-        var newRequest = helpers.buildHttpMessage(headers,body.getBytes());
-        messageInfo.setRequest(newRequest);
-    }
-    public void addResponseHeaders(IHttpRequestResponse messageInfo){
-        var response = messageInfo.getResponse();
-        var responseStr = helpers.bytesToString(response);
-        var responseParsed = helpers.analyzeResponse(response);
-        var body = responseStr.substring(responseParsed.getBodyOffset());
-        var headers = responseParsed.getHeaders();
-        for(String header : headers){
-            if (header.startsWith("Access-Control-Allow-Origin:")){
-                headers.remove(header);
-                headers.add("Access-Control-Allow-Origin: http://localhost:8090");
-                break;
-            }
-            if (header.startsWith("Access-Control-Allow-Headers:")){
-                headers.remove(header);
-                headers.add("Access-Control-Allow-Headers: *");
-                break;
-            }
-        }
-        // Will run if we don't find any ACAO headers in response
-        if (!headers.contains("Access-Control-Allow-Origin: http://localhost:8090")){
-            headers.add("Access-Control-Allow-Origin: http://localhost:8090");
-        }
-        if (!headers.contains("Access-Control-Allow-Headers: *")){
-            headers.add("Access-Control-Allow-Headers: *");
-        }
-        var newResponse = helpers.buildHttpMessage(headers,body.getBytes());
-        messageInfo.setResponse(newResponse);
-    }
-    public void dropHtml(JsonArray htmlHolder) {
-        Writer writer;
-        try {
-            writer = Files.newBufferedWriter(Paths.get("burp2swagger_out/index.html"));
-            writer.write("""
-                    <!DOCTYPE html>
-                    <html lang="en">
-                      <head>
-                        <meta charset="UTF-8">
-                        <title>Swagger UI</title>
-                        <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/4.12.0/swagger-ui.css" />
-                        <style>
-                        html {
-                            box-sizing: border-box;
-                            overflow: -moz-scrollbars-vertical;
-                            overflow-y: scroll;
-                        }
-                        
-                        *,
-                        *:before,
-                        *:after {
-                            box-sizing: inherit;
-                        }
-                        
-                        body {
-                            margin: 0;
-                            background: #fafafa;
-                        }
-                        </style>
-                        <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAAAkFBMVEUAAAAQM0QWNUYWNkYXNkYALjoWNUYYOEUXN0YaPEUPMUAUM0QVNUYWNkYWNUYWNUUWNUYVNEYWNkYWNUYWM0eF6i0XNkchR0OB5SwzZj9wyTEvXkA3az5apTZ+4C5DgDt31C9frjU5bz5uxTI/eDxzzjAmT0IsWUEeQkVltzR62S6D6CxIhzpKijpJiDpOkDl4b43lAAAAFXRSTlMAFc304QeZ/vj+ECB3xKlGilPXvS2Ka/h0AAABfklEQVR42oVT2XaCMBAdJRAi7pYJa2QHxbb//3ctSSAUPfa+THLmzj4DBvZpvyauS9b7kw3PWDkWsrD6fFQhQ9dZLfVbC5M88CWCPERr+8fLZodJ5M8QJbjbGL1H2M1fIGfEm+wJN+bGCSc6EXtNS/8FSrq2VX6YDv++XLpJ8SgDWMnwqznGo6alcTbIxB2CHKn8VFikk2mMV2lEnV+CJd9+jJlxXmMr5dW14YCqwgbFpO8FNvJxwwM4TPWPo5QalEsRMAcusXpi58/QUEWPL0AK1ThM5oQCUyXPoPINkdd922VBw4XgTV9zDGWWFrgjIQs4vwvOg6xr+6gbCTqE+DYhlMGX0CF2OknK5gQ2JrkDh/W6TOEbYDeVecKbJtyNXiCfGmW7V93J2hDus1bDfhxWbIZVYDXITA7Lo6E0Ktgg9eB4KWuR44aj7ppBVPazhQH7/M/KgWe9X1qAg8XypT6nxIMJH+T94QCsLvj29IYwZxyO9/F8vCbO9tX5/wDGjEZ7vrgFZwAAAABJRU5ErkJggg==" sizes="32x32" />
-                        <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAABNVBMVEVisTRhsTReqzVbpTVXoDdVnTdSlzhRljgvXkAuXUAtWkErV0EzZj40Zj85bz0lTkMkTUMkT0MmTUIkS0IjTEIhSUMkS0IkTEIkTUIlTUIkTkMlTkMcQUQcP0UfQ0QdQ0QfREQgRUMiSUMiSUMjSkInU0EkTEMmUEEiR0IiSEMpVkErWT8kTUElTUIUNkYVNEQVMkcRM0QSNUYQMUIMMUkVK0AAJEkAM00AMzMAAAAAAACF6i2E6SyD6CyC5i2B5Sx/4i6A4S593S583S520jB00DByyjFxyTFwyDFvxjJtxTFtxDFswzJrwDJqvzJpvjNouzNoujNnuDNLjTlKijpKiTpEfztDfzxAeT0+dz05bj44bT44bj82aj81aD8zZT8bPUUbPkUcP0UcPUUeQ0UfREQgRkRgJREvAAAAO3RSTlP09PX19vX39u7u7/Dq6ufh4eDg4+Pf3Nvb2tnY2NvPv7y6rKupqaGZlpSOiYWETDEkHh0fFQwHCgUBAAcHrskAAADYSURBVHjaPc/ZLkNRGIbhz26KjVJpqSKGtjHPc9a7W7OEEhtBjDWUO3XghqQSwVrNTp+j///OXhlrLpdJdg9MLblbxqwPd5RLUDpOjK66YWMwTqRpaM0OhZbo3dskljea9+HyAevxHtoWVAjhfQtr5w3CSfUE8BrgvEDQpxRc3eyfH5wenlQuIO39Sb9x/8uv+bXvmPSjbABPRZznIkGvxkOo7mJtV+FsQsutcFvBuruG9kWZMY+G5pzxlMp/KPKZSUs2cLrzyMWVEyP1OGtlNpvs6p+p5/8DzUo5hMDku9EAAAAASUVORK5CYII=" sizes="16x16" />
-                      </head>
-                                        
-                      <body>
-                        <div id="swagger-ui"></div>
-                        <script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/4.12.0/swagger-ui-bundle.js" charset="UTF-8"> </script>
-                        <script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/4.12.0/swagger-ui-standalone-preset.js" charset="UTF-8"> </script>
-                                        
-                    <script>
-                    window.onload = function() {
-                      window.ui = SwaggerUIBundle({
-                        urls:"""+ gson.toJson(htmlHolder) + """
-                        ,
-                        dom_id: '#swagger-ui',
-                        deepLinking: true,
-                        presets: [
-                          SwaggerUIBundle.presets.apis,
-                          SwaggerUIStandalonePreset
-                        ],
-                        plugins: [
-                          SwaggerUIBundle.plugins.DownloadUrl
-                        ],
-                        layout: "StandaloneLayout"
-                      });
-                    };
-                    </script>
-                    </body>
-                    </html>
-                    """);
-            writer.close();
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-
-
-    }
-    @Override
-    public void extensionUnloaded() {
-        server.stop(0);
-    }
-
-    @Override
-    public List<JMenuItem> createMenuItems(IContextMenuInvocation invocation) {
-        if (invocation.getInvocationContext() == IContextMenuInvocation.CONTEXT_TARGET_SITE_MAP_TREE){
-            ArrayList<JMenuItem> menuItemList = new ArrayList<>();
-            var menuItem = new JMenuItem("Get Json");
-            menuItem.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent e) {
-                    var selectedRequest = helpers.analyzeRequest(invocation.getSelectedMessages()[0]);
-                    var domain = selectedRequest.getUrl().getProtocol() + "://" + selectedRequest.getUrl().getHost();
-                    var sitemap = callbacks.getSiteMap(domain);
-                    if (jsonHelpers.containsKey(domain)){
-                        jsonHelper = jsonHelpers.get(domain);
-                    }
-                    else {
-                        jsonHelper = new JsonHelper();
-                        jsonHelpers.put(domain,jsonHelper);
-                    }
-                    jsonHelper.addDomain(domain);
-                    jsonHelper.addAuth();
-                    for (IHttpRequestResponse singleMessage : sitemap){
-                        if (singleMessage.getResponse() != null){
-                            if (!helpers.analyzeRequest(singleMessage).getUrl().getPath().contains(".")){
-                                jsonHelper.addRequest(singleMessage,helpers);
+                        // Try to parse as JSON to validate it's a spec
+                        try {
+                            JsonElement parsed = JsonParser.parseString(body);
+                            if (!parsed.isJsonObject()) {
+                                api.logging().logToError("Burp2Swagger: response is not a JSON object, skipping");
+                                continue;
                             }
+                        } catch (JsonSyntaxException ex) {
+                            api.logging().logToError("Burp2Swagger: response is not valid JSON, skipping");
+                            continue;
                         }
+
+                        // Derive a name from the URL
+                        String specName = deriveSpecName(rr);
+                        specs.put(specName, body);
+                        saveSpec(specName, body);
+                        api.logging().logToOutput("Burp2Swagger: added spec '" + specName + "'");
                     }
-                    saveToFiles(domain);
-                    System.out.println("done");
-                }
-            });
-            menuItemList.add(menuItem);
-            return menuItemList;
+                    rebuildIndex();
+                    api.logging().logToOutput("Burp2Swagger: open http://localhost:8090");
+                });
+
+                return List.of(sendItem);
+            }
+        });
+
+        // Unload handler
+        api.extension().registerUnloadingHandler(() -> {
+            serverRunning = false;
+            try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
+        });
+
+        api.logging().logToOutput("Burp2Swagger: loaded. Right-click any request with an OpenAPI response → 'Send to Swagger UI'");
+    }
+
+    private String deriveSpecName(HttpRequestResponse rr) {
+        var req = rr.request();
+        var svc = req.httpService();
+        String host = svc.host();
+        String path = req.pathWithoutQuery();
+        // Clean up path for filename
+        String cleanPath = path.replaceAll("[^a-zA-Z0-9._-]", "_");
+        if (cleanPath.startsWith("_")) cleanPath = cleanPath.substring(1);
+        if (cleanPath.isEmpty()) cleanPath = "spec";
+        return host + "_" + cleanPath;
+    }
+
+    private void saveSpec(String name, String json) {
+        try {
+            Path file = outDir.resolve(name + ".json");
+            Files.writeString(file, json, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            api.logging().logToError("Burp2Swagger: failed to write spec: " + e.getMessage());
         }
-        return null;
+    }
+
+    private void rebuildIndex() {
+        JsonArray urls = new JsonArray();
+        for (var entry : specs.entrySet()) {
+            JsonObject u = new JsonObject();
+            u.addProperty("url", "http://localhost:8090/" + entry.getKey() + ".json");
+            // Try to extract title from the spec
+            String title = entry.getKey();
+            try {
+                JsonObject spec = JsonParser.parseString(entry.getValue()).getAsJsonObject();
+                if (spec.has("info") && spec.getAsJsonObject("info").has("title")) {
+                    title = spec.getAsJsonObject("info").get("title").getAsString();
+                }
+            } catch (Exception ignored) {}
+            u.addProperty("name", title);
+            urls.add(u);
+        }
+
+        String html = "<!DOCTYPE html>\n"
+                + "<html lang=\"en\">\n"
+                + "<head>\n"
+                + "  <meta charset=\"UTF-8\">\n"
+                + "  <title>Swagger UI - Burp2Swagger</title>\n"
+                + "  <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui.css\" />\n"
+                + "  <style>html{box-sizing:border-box;overflow-y:scroll}*,*:before,*:after{box-sizing:inherit}body{margin:0;background:#fafafa}</style>\n"
+                + "</head>\n"
+                + "<body>\n"
+                + "  <div id=\"swagger-ui\"></div>\n"
+                + "  <script src=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.js\"></script>\n"
+                + "  <script src=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-standalone-preset.js\"></script>\n"
+                + "  <script>\n"
+                + "    window.onload = function() {\n"
+                + "      SwaggerUIBundle({\n"
+                + "        urls: " + gson.toJson(urls) + ",\n"
+                + "        dom_id: '#swagger-ui',\n"
+                + "        deepLinking: true,\n"
+                + "        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],\n"
+                + "        plugins: [SwaggerUIBundle.plugins.DownloadUrl],\n"
+                + "        layout: 'StandaloneLayout'\n"
+                + "      });\n"
+                + "    };\n"
+                + "  </script>\n"
+                + "</body>\n"
+                + "</html>";
+
+        try {
+            Files.writeString(outDir.resolve("index.html"), html, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            api.logging().logToError("Burp2Swagger: failed to write index.html: " + e.getMessage());
+        }
+    }
+
+    // --- Minimal HTTP server using plain sockets ---
+
+    private void runServer() {
+        while (serverRunning) {
+            try {
+                Socket client = serverSocket.accept();
+                Thread.ofVirtual().start(() -> handleClient(client));
+            } catch (Exception e) {
+                if (serverRunning) {
+                    api.logging().logToError("Burp2Swagger: server error: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    private void handleClient(Socket client) {
+        try (client;
+             BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+             OutputStream out = client.getOutputStream()) {
+
+            String requestLine = in.readLine();
+            if (requestLine == null) return;
+            // Consume headers
+            while (true) {
+                String line = in.readLine();
+                if (line == null || line.isEmpty()) break;
+            }
+
+            String[] parts = requestLine.split(" ");
+            if (parts.length < 2) return;
+            String path = parts[1];
+            if (path.equals("/")) path = "/index.html";
+            int q = path.indexOf('?');
+            if (q != -1) path = path.substring(0, q);
+
+            Path filePath = outDir.resolve(path.substring(1)).normalize();
+            if (!filePath.startsWith(outDir) || !Files.exists(filePath) || Files.isDirectory(filePath)) {
+                String resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\nConnection: close\r\n\r\n404 Not Found";
+                out.write(resp.getBytes());
+                return;
+            }
+
+            byte[] data = Files.readAllBytes(filePath);
+            String ct = "application/octet-stream";
+            String name = filePath.getFileName().toString();
+            if (name.endsWith(".html")) ct = "text/html; charset=utf-8";
+            else if (name.endsWith(".json")) ct = "application/json; charset=utf-8";
+
+            String header = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: " + ct + "\r\n"
+                    + "Content-Length: " + data.length + "\r\n"
+                    + "Access-Control-Allow-Origin: *\r\n"
+                    + "Connection: close\r\n\r\n";
+            out.write(header.getBytes());
+            out.write(data);
+        } catch (Exception ignored) {}
     }
 }
